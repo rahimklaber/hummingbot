@@ -90,31 +90,7 @@ MARKETS = {
     "USDC-XLM": {
         "base": "USDC",
         "quote": "XLM",
-        "base_issuer": "ISSUER_ADDRESS_HERE",
+        "base_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
         "quote_issuer": "",
-    },
-    "AQUA-XLM": {
-        "base": "AQUA",
-        "quote": "XLM",
-        "base_issuer": "ISSUER_ADDRESS_HERE",
-        "quote_issuer": "",
-    },
-    "yXLM-XLM": {
-        "base": "yXLM",
-        "quote": "XLM",
-        "base_issuer": "ISSUER_ADDRESS_HERE",
-        "quote_issuer": "",
-    },
-    "BTC-USDC": {
-        "base": "BTC",
-        "quote": "USDC",
-        "base_issuer": "ISSUER_ADDRESS_HERE",
-        "quote_issuer": "ISSUER_ADDRESS_HERE",
-    },
-    "ETH-USDC": {
-        "base": "ETH",
-        "quote": "USDC",
-        "base_issuer": "ISSUER_ADDRESS_HERE",
-        "quote_issuer": "ISSUER_ADDRESS_HERE",
     },
 }
