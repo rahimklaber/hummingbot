@@ -543,9 +543,37 @@ class StellarExchange(ExchangePyBase):
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         """Submit a cancel transaction and return immediately. Confirmation via background resolver."""
         exchange_order_id = tracked_order.exchange_order_id
-        if exchange_order_id is None:
-            self.logger().error(f"Cannot cancel order {order_id}: no exchange_order_id")
-            return False
+
+        # If the order is still pending confirmation (no offer_id yet),
+        # we can't cancel it on-chain. Wait briefly for the resolver to confirm it.
+        if exchange_order_id is None or not exchange_order_id.isdigit():
+            # Check if there's a pending tx for this order
+            pending_hash = None
+            for tx_hash, pending in self._pending_transactions.items():
+                if pending.client_order_id == order_id and not pending.is_cancel:
+                    pending_hash = tx_hash
+                    break
+
+            if pending_hash is not None:
+                # Wait for the pending tx to resolve (up to 10s)
+                for _ in range(20):
+                    if pending_hash not in self._pending_transactions:
+                        break
+                    await asyncio.sleep(0.5)
+
+                # Re-check after waiting
+                tracked_order = self._order_tracker.active_orders.get(order_id)
+                if tracked_order is None:
+                    self.logger().info(f"Order {order_id} already resolved, skip cancel")
+                    return True
+                exchange_order_id = tracked_order.exchange_order_id
+
+            if exchange_order_id is None or not exchange_order_id.isdigit():
+                self.logger().error(
+                    f"Cannot cancel order {order_id}: no valid offer_id "
+                    f"(exchange_order_id={exchange_order_id})"
+                )
+                return False
 
         server = self._get_soroban_server()
         channel = None
