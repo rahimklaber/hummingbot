@@ -55,10 +55,11 @@ class StellarExchange(ExchangePyBase):
         self._stellar_secret_key = stellar_secret_key
         self._rpc_url = rpc_url
         self._trading_required = trading_required
-        self._trading_pairs = trading_pairs
+        self._trading_pairs = trading_pairs or []
         self._custom_markets = custom_markets or {}
         # Merge default markets with custom markets (custom overrides defaults)
         self._all_markets: Dict[str, StellarMarket] = self._load_markets()
+
         self._stellar_auth: StellarAuth = self.authenticator
         self._nonce_creator = NonceCreator.for_milliseconds()
         self._network_passphrase = Network.PUBLIC_NETWORK_PASSPHRASE
@@ -80,6 +81,9 @@ class StellarExchange(ExchangePyBase):
         self._order_status_lock_manager = asyncio.Lock()
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+
+        # Must be called AFTER super().__init__() so _trading_pair_symbol_map exists
+        self._initialize_trading_pair_symbols_from_exchange_info(self._all_markets)
 
     # ---- Order tracker ----
 
@@ -168,6 +172,7 @@ class StellarExchange(ExchangePyBase):
         mapping_symbol = bidict()
         for market in exchange_info:
             mapping_symbol[market.upper()] = market.upper()
+        print(mapping_symbol)  # --- IGNORE ---
         self._set_trading_pair_symbol_map(mapping_symbol)
 
     def _load_markets(self) -> Dict[str, StellarMarket]:
@@ -185,11 +190,7 @@ class StellarExchange(ExchangePyBase):
         return loaded_markets
 
     async def _initialize_trading_pair_symbol_map(self):
-        try:
-            all_markets = self._load_markets()
-            self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=all_markets)
-        except Exception as e:
-            self.logger().exception(f"There was an error requesting exchange info: {e}")
+        pass
 
     async def _make_network_check_request(self):
         server = self._get_soroban_server()
@@ -663,7 +664,7 @@ class StellarExchange(ExchangePyBase):
         # Stellar DEX has no maker/taker fees, only network base fee
         fee = AddedToCostTradeFee(
             percent=Decimal("0"),
-            flat_fees=[TokenAmount(token="XLM", amount=Decimal("0.00001"))],
+            flat_fees=[TokenAmount(token="XLM", amount=Decimal("0.0001"))],
         )
         return fee
 
