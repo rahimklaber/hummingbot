@@ -203,7 +203,7 @@ class StellarAPIOrderBookDataSource(OrderBookTrackerDataSource):
             "trading_pair": trading_pair,
             "price": trade["price"],
             "amount": trade["amount"],
-            "transact_time": trade["update_id"],
+            "update_id": trade.get("update_id", trade.get("timestamp", 0)),
             "trade_id": trade["trade_id"],
             "trade_type": trade["trade_type"],
             "timestamp": trade["timestamp"],
