@@ -3,6 +3,7 @@ import time
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
+from bidict import bidict
 from stellar_sdk import AiohttpClient, Keypair, Network, SorobanServerAsync, TransactionBuilder
 
 from hummingbot.connector.client_order_tracker import ClientOrderTracker
@@ -158,6 +159,12 @@ class StellarExchange(ExchangePyBase):
             auth=self._stellar_auth,
             connector=self,
         )
+
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, StellarMarket]):
+        mapping_symbol = bidict()
+        for market in exchange_info:
+            mapping_symbol[market.upper()] = market.upper()
+        self._set_trading_pair_symbol_map(mapping_symbol)
 
     # ---- Soroban server ----
 
