@@ -94,8 +94,8 @@ class StellarConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         },
     )
-    channel_account_secret_keys: list = Field(
-        default=[],
+    channel_account_secret_keys: SecretStr = Field(
+        default="",
         json_schema_extra={
             "prompt": "Enter channel account secret keys (comma separated, for parallel order submission)",
             "is_secure": True,
@@ -112,8 +112,10 @@ class StellarConfigMap(BaseConnectorConfigMap):
     @field_validator("channel_account_secret_keys", mode="before")
     @classmethod
     def validate_channel_keys(cls, v):
-        if isinstance(v, str):
-            v = [key.strip() for key in v.split(",") if key.strip()]
+        if isinstance(v, list):
+            v = ",".join(v)
+        if isinstance(v, SecretStr):
+            return v
         return v
 
 

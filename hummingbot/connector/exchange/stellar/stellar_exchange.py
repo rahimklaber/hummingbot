@@ -45,7 +45,7 @@ class StellarExchange(ExchangePyBase):
         self,
         stellar_secret_key: str,
         rpc_url: str,
-        channel_account_secret_keys: list = None,
+        channel_account_secret_keys: str = None,
         custom_markets: Optional[Dict[str, StellarMarket]] = None,
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
@@ -62,7 +62,9 @@ class StellarExchange(ExchangePyBase):
         self._network_passphrase = Network.PUBLIC_NETWORK_PASSPHRASE
 
         # Channel account pool for parallel tx submission
-        channel_keys = channel_account_secret_keys or []
+        channel_keys = []
+        if channel_account_secret_keys:
+            channel_keys = [k.strip() for k in channel_account_secret_keys.split(",") if k.strip()]
         self._channel_pool: Optional[ChannelAccountPool] = (
             ChannelAccountPool(channel_keys) if channel_keys else None
         )
