@@ -168,6 +168,19 @@ class StellarExchange(ExchangePyBase):
             mapping_symbol[market.upper()] = market.upper()
         self._set_trading_pair_symbol_map(mapping_symbol)
 
+    async def _initialize_trading_pair_symbol_map(self):
+        try:
+            self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=self._custom_markets)
+        except Exception as e:
+            self.logger().exception(f"There was an error requesting exchange info: {e}")
+
+    async def _make_network_check_request(self):
+        server = self._get_soroban_server()
+        try:
+            await server.get_health()
+        finally:
+            await server.close()
+
     # ---- Soroban server ----
 
     def _get_soroban_server(self) -> SorobanServerAsync:
@@ -540,6 +553,7 @@ class StellarExchange(ExchangePyBase):
             from stellar_sdk.xdr import (
                 AccountID,
                 LedgerEntryData,
+                LedgerEntryType,
                 LedgerKey,
                 LedgerKeyAccount,
                 LedgerKeyTrustLine,
@@ -552,7 +566,10 @@ class StellarExchange(ExchangePyBase):
                 type=PublicKeyType.PUBLIC_KEY_TYPE_ED25519,
                 ed25519=Uint256(Keypair.from_public_key(account_id).raw_public_key()),
             )
-            ledger_key = LedgerKey.from_account(LedgerKeyAccount(account_id=AccountID(account_pubkey)))
+            ledger_key = LedgerKey(
+                type=LedgerEntryType.ACCOUNT,
+                account=LedgerKeyAccount(account_id=AccountID(account_pubkey)),
+            )
 
             response = await server.get_ledger_entries([ledger_key])
 
@@ -592,10 +609,13 @@ class StellarExchange(ExchangePyBase):
                     if not asset.is_native() and name in local_asset_names:
                         try:
                             tl_asset = asset.to_trust_line_asset_xdr_object()
-                            tl_key = LedgerKey.from_trust_line(LedgerKeyTrustLine(
-                                account_id=AccountID(account_pubkey),
-                                asset=tl_asset,
-                            ))
+                            tl_key = LedgerKey(
+                                type=LedgerEntryType.TRUSTLINE,
+                                trust_line=LedgerKeyTrustLine(
+                                    account_id=AccountID(account_pubkey),
+                                    asset=tl_asset,
+                                ),
+                            )
                             tl_response = await server.get_ledger_entries([tl_key])
                             if tl_response.entries:
                                 for tl_entry in tl_response.entries:
@@ -802,16 +822,28 @@ class StellarExchange(ExchangePyBase):
         try:
             offer_id = int(tracked_order.exchange_order_id)
 
-            from stellar_sdk.xdr import AccountID, Int64, LedgerKey, LedgerKeyOffer, PublicKey, PublicKeyType, Uint256
+            from stellar_sdk.xdr import (
+                AccountID,
+                Int64,
+                LedgerEntryType,
+                LedgerKey,
+                LedgerKeyOffer,
+                PublicKey,
+                PublicKeyType,
+                Uint256,
+            )
 
             account_pubkey = PublicKey(
                 type=PublicKeyType.PUBLIC_KEY_TYPE_ED25519,
                 ed25519=Uint256(self._stellar_auth.get_keypair().raw_public_key()),
             )
-            offer_key = LedgerKey.from_offer(LedgerKeyOffer(
-                seller_id=AccountID(account_pubkey),
-                offer_id=Int64(offer_id),
-            ))
+            offer_key = LedgerKey(
+                type=LedgerEntryType.OFFER,
+                offer=LedgerKeyOffer(
+                    seller_id=AccountID(account_pubkey),
+                    offer_id=Int64(offer_id),
+                ),
+            )
 
             response = await server.get_ledger_entries([offer_key])
 
