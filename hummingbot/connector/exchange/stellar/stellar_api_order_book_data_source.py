@@ -225,3 +225,17 @@ class StellarAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
         raise NotImplementedError("Stellar DEX uses ledger polling, not WebSocket")
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        """Dynamic subscription not supported for this connector."""
+        self.logger().warning(
+            f"Dynamic subscription not supported for {self.__class__.__name__}"
+        )
+        return False
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        """Dynamic unsubscription not supported for this connector."""
+        self.logger().warning(
+            f"Dynamic unsubscription not supported for {self.__class__.__name__}"
+        )
+        return False
