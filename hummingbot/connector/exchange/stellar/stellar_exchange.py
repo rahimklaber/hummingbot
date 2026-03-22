@@ -37,7 +37,7 @@ from hummingbot.core.utils.tracking_nonce import NonceCreator
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 # Timeout for pending transactions before marking them as failed
-PENDING_TX_TIMEOUT = 60  # seconds
+PENDING_TX_TIMEOUT = 10  # seconds
 PENDING_TX_POLL_INTERVAL = 2  # seconds
 
 
