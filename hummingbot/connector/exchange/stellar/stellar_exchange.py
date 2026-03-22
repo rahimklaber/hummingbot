@@ -354,6 +354,16 @@ class StellarExchange(ExchangePyBase):
                     channel = None
                 raise Exception(f"Transaction submission failed: {response.status}")
 
+            # Mark order as PENDING_CREATE now that tx is submitted
+            order_update = OrderUpdate(
+                client_order_id=order_id,
+                exchange_order_id=response.hash,
+                trading_pair=trading_pair,
+                update_timestamp=transact_time,
+                new_state=OrderState.PENDING_CREATE,
+            )
+            self._order_tracker.process_order_update(order_update)
+
             # Track the pending transaction — channel is held until confirmation
             pending = PendingTransaction(
                 tx_hash=response.hash,
