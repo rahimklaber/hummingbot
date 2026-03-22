@@ -57,6 +57,8 @@ class StellarExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._custom_markets = custom_markets or {}
+        # Merge default markets with custom markets (custom overrides defaults)
+        self._all_markets: Dict[str, StellarMarket] = self._load_markets()
         self._stellar_auth: StellarAuth = self.authenticator
         self._nonce_creator = NonceCreator.for_milliseconds()
         self._network_passphrase = Network.PUBLIC_NETWORK_PASSPHRASE
@@ -168,9 +170,24 @@ class StellarExchange(ExchangePyBase):
             mapping_symbol[market.upper()] = market.upper()
         self._set_trading_pair_symbol_map(mapping_symbol)
 
+    def _load_markets(self) -> Dict[str, StellarMarket]:
+        """Load default markets from constants and merge with custom markets."""
+        loaded_markets: Dict[str, StellarMarket] = {}
+        for k, v in CONSTANTS.MARKETS.items():
+            loaded_markets[k] = StellarMarket(
+                base=v["base"],
+                quote=v["quote"],
+                base_issuer=v["base_issuer"],
+                quote_issuer=v["quote_issuer"],
+                trading_pair_symbol=k,
+            )
+        loaded_markets.update(self._custom_markets)
+        return loaded_markets
+
     async def _initialize_trading_pair_symbol_map(self):
         try:
-            self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=self._custom_markets)
+            all_markets = self._load_markets()
+            self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=all_markets)
         except Exception as e:
             self.logger().exception(f"There was an error requesting exchange info: {e}")
 
@@ -230,7 +247,7 @@ class StellarExchange(ExchangePyBase):
 
         exchange_order_id format: "{offer_id}" (extracted from tx result)
         """
-        base_asset, quote_asset = trading_pair_to_assets(trading_pair, self._custom_markets)
+        base_asset, quote_asset = trading_pair_to_assets(trading_pair, self._all_markets)
 
         exchange_order_id = "UNKNOWN"
         transact_time = time.time()
@@ -400,7 +417,7 @@ class StellarExchange(ExchangePyBase):
         try:
             offer_id = int(exchange_order_id)
             base_asset, quote_asset = trading_pair_to_assets(
-                tracked_order.trading_pair, self._custom_markets
+                tracked_order.trading_pair, self._all_markets
             )
 
             # Use channel account or main account for tx source
@@ -601,7 +618,7 @@ class StellarExchange(ExchangePyBase):
 
             # For non-native assets, query trustline entries
             for trading_pair in self._trading_pairs:
-                base_asset, quote_asset = trading_pair_to_assets(trading_pair, self._custom_markets)
+                base_asset, quote_asset = trading_pair_to_assets(trading_pair, self._all_markets)
                 for asset, name in [
                     (base_asset, trading_pair.split("-")[0]),
                     (quote_asset, trading_pair.split("-")[1]),

@@ -83,3 +83,38 @@ LEDGER_POLL_INTERVAL = 5
 
 # Number of ledgers to fetch per poll
 GET_LEDGERS_BATCH_SIZE = 5
+
+# Default trading pairs
+# Fill in the issuer addresses for each asset
+MARKETS = {
+    "USDC-XLM": {
+        "base": "USDC",
+        "quote": "XLM",
+        "base_issuer": "ISSUER_ADDRESS_HERE",
+        "quote_issuer": "",
+    },
+    "AQUA-XLM": {
+        "base": "AQUA",
+        "quote": "XLM",
+        "base_issuer": "ISSUER_ADDRESS_HERE",
+        "quote_issuer": "",
+    },
+    "yXLM-XLM": {
+        "base": "yXLM",
+        "quote": "XLM",
+        "base_issuer": "ISSUER_ADDRESS_HERE",
+        "quote_issuer": "",
+    },
+    "BTC-USDC": {
+        "base": "BTC",
+        "quote": "USDC",
+        "base_issuer": "ISSUER_ADDRESS_HERE",
+        "quote_issuer": "ISSUER_ADDRESS_HERE",
+    },
+    "ETH-USDC": {
+        "base": "ETH",
+        "quote": "USDC",
+        "base_issuer": "ISSUER_ADDRESS_HERE",
+        "quote_issuer": "ISSUER_ADDRESS_HERE",
+    },
+}

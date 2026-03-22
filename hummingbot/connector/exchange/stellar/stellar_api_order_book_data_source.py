@@ -57,7 +57,7 @@ class StellarAPIOrderBookDataSource(OrderBookTrackerDataSource):
     def _initialize_order_books(self):
         for trading_pair in self._trading_pairs:
             base_asset, quote_asset = trading_pair_to_assets(
-                trading_pair, self._connector._custom_markets
+                trading_pair, self._connector._all_markets
             )
             self._internal_order_books[trading_pair] = InternalStellarOrderBook(
                 selling_asset=base_asset, buying_asset=quote_asset
