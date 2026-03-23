@@ -95,12 +95,12 @@ class StellarConfigMap(BaseConnectorConfigMap):
         },
     )
     channel_account_secret_keys: SecretStr = Field(
-        default="",
+        default=...,
         json_schema_extra={
             "prompt": "Enter channel account secret keys (comma separated, for parallel order submission)",
             "is_secure": True,
             "is_connect_key": True,
-            "prompt_on_new": False,
+            "prompt_on_new": True,
         },
     )
     custom_markets: Dict[str, StellarMarket] = Field(
