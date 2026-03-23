@@ -136,11 +136,8 @@ def trading_pair_to_assets(
     Uses custom_markets for issuer resolution."""
     if trading_pair in custom_markets:
         return custom_markets[trading_pair].to_stellar_assets()
-    # Fallback: try to parse directly (won't have issuer info for non-native assets)
-    base, quote = trading_pair.split("-")
-    base_asset = Asset.native() if base == "XLM" else Asset(base, "")
-    quote_asset = Asset.native() if quote == "XLM" else Asset(quote, "")
-    return base_asset, quote_asset
+
+    raise ValueError(f"Trading pair {trading_pair} not found in custom markets for issuer resolution.")
 
 
 def assets_to_trading_pair(

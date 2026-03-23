@@ -129,6 +129,7 @@ class StellarExchange(ExchangePyBase):
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
         # Must be called AFTER super().__init__() so _trading_pair_symbol_map exists
+        self._trading_pairs = trading_pairs or list(self._all_markets.keys())
         self._initialize_trading_pair_symbols_from_exchange_info(self._all_markets)
 
     # ---- Order tracker ----
