@@ -40,18 +40,36 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 # Timeout for pending transactions before marking them as failed
 PENDING_TX_TIMEOUT = 10  # seconds
 PENDING_TX_POLL_INTERVAL = 2  # seconds
+TX_BATCH_WAIT_MS = 100  # milliseconds to wait for batching operations
+TX_MAX_OPERATIONS = 100  # max operations per Stellar transaction
+
+
+@dataclass
+class BatchedOperation:
+    """A single operation queued for batching into a transaction."""
+    client_order_id: str
+    trading_pair: str
+    future: asyncio.Future
+    # For new orders
+    is_cancel: bool = False
+    trade_type: Optional[TradeType] = None
+    amount: Optional[Decimal] = None
+    price: Optional[Decimal] = None
+    # For cancels
+    cancel_offer_id: Optional[int] = None
+    cancel_trade_type: Optional[TradeType] = None
 
 
 @dataclass
 class PendingTransaction:
     """Tracks a submitted but unconfirmed transaction."""
     tx_hash: str
-    client_order_id: str
-    trading_pair: str
+    order_ids: List[str]  # client_order_ids in operation order
+    trading_pairs: List[str]  # trading pairs in operation order
     submit_time: float
     channel: Optional[ChannelAccount] = None
-    is_cancel: bool = False
-    cancel_offer_id: Optional[int] = None
+    cancel_offer_ids: Optional[Dict[str, int]] = None  # client_order_id -> offer_id for cancels
+    is_cancel_flags: Optional[Dict[str, bool]] = None  # client_order_id -> is_cancel
 
 
 class StellarOrderTracker(ClientOrderTracker):
@@ -95,17 +113,18 @@ class StellarExchange(ExchangePyBase):
         # Offer ID to client_order_id mapping
         self._offer_id_to_order_id: Dict[int, str] = {}
         # Pending transactions awaiting confirmation
-        self._pending_transactions: Dict[str, PendingTransaction] = {}  # tx_hash -> PendingTransaction
-        # tx_hash -> client_order_id for mapping confirmed txs
-        self._tx_hash_to_order_id: Dict[str, str] = {}
+        self._pending_transactions: Dict[str, PendingTransaction] = {}
+
+        # Transaction batching queue
+        self._batch_queue: asyncio.Queue = asyncio.Queue()
 
         # Order locking
-        self._place_order_lock = asyncio.Lock()
         self._order_status_locks: Dict[str, asyncio.Lock] = {}
         self._order_status_lock_manager = asyncio.Lock()
 
-        # Background resolver task
+        # Background tasks
         self._pending_order_resolver_task: Optional[asyncio.Task] = None
+        self._tx_batcher_task: Optional[asyncio.Task] = None
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -122,11 +141,15 @@ class StellarExchange(ExchangePyBase):
     async def start_network(self):
         await super().start_network()
         self._pending_order_resolver_task = safe_ensure_future(self._pending_order_resolver_loop())
+        self._tx_batcher_task = safe_ensure_future(self._tx_batcher_loop())
 
     async def stop_network(self):
         if self._pending_order_resolver_task is not None:
             self._pending_order_resolver_task.cancel()
             self._pending_order_resolver_task = None
+        if self._tx_batcher_task is not None:
+            self._tx_batcher_task.cancel()
+            self._tx_batcher_task = None
         # Release any held channel accounts
         for pending_tx in list(self._pending_transactions.values()):
             if pending_tx.channel is not None and self._channel_pool is not None:
@@ -273,7 +296,7 @@ class StellarExchange(ExchangePyBase):
                 results[trading_pair] = 0.0
         return results
 
-    # ---- Place order (non-blocking) ----
+    # ---- Place order (batched) ----
 
     async def _place_order(
         self,
@@ -286,55 +309,129 @@ class StellarExchange(ExchangePyBase):
         **kwargs,
     ) -> Tuple[str, float]:
         """
-        Submit an order to the Stellar DEX and return immediately.
-        The order stays in PENDING_CREATE state until the background resolver
-        confirms it via get_transaction() or the user stream picks it up.
-        Returns (tx_hash, submit_time) — tx_hash is the temporary exchange_order_id.
+        Queue an order for batched submission.
+        Returns (temporary_id, submit_time). The background batcher will submit the tx
+        and the resolver will confirm it with the real offer_id.
         """
-        base_asset, quote_asset = trading_pair_to_assets(trading_pair, self._all_markets)
-        transact_time = time.time()
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
 
+        op = BatchedOperation(
+            client_order_id=order_id,
+            trading_pair=trading_pair,
+            future=future,
+            trade_type=trade_type,
+            amount=amount,
+            price=price,
+        )
+        await self._batch_queue.put(op)
+
+        # Wait for the batcher to submit and return the tx_hash
+        tx_hash = await future
+        return tx_hash, time.time()
+
+    # ---- Transaction batcher ----
+
+    async def _tx_batcher_loop(self):
+        """
+        Background loop that collects operations for TX_BATCH_WAIT_MS, then
+        builds and submits a single transaction with up to TX_MAX_OPERATIONS.
+        """
+        while True:
+            try:
+                # Wait for the first operation
+                first_op = await self._batch_queue.get()
+                batch: List[BatchedOperation] = [first_op]
+
+                # Wait TX_BATCH_WAIT_MS to collect more operations
+                deadline = time.time() + TX_BATCH_WAIT_MS / 1000.0
+                while len(batch) < TX_MAX_OPERATIONS:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        op = await asyncio.wait_for(self._batch_queue.get(), timeout=remaining)
+                        batch.append(op)
+                    except asyncio.TimeoutError:
+                        break
+
+                self.logger().info(f"Batching {len(batch)} operations into one transaction")
+                await self._submit_batch(batch)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().error(f"Error in tx batcher: {e}", exc_info=True)
+                await asyncio.sleep(1)
+
+    async def _submit_batch(self, batch: List[BatchedOperation]):
+        """Build and submit a single transaction for a batch of operations."""
         server = self._get_soroban_server()
         channel = None
 
         try:
-            # Determine which account to use for the transaction source
+            # Acquire a channel account (or use main)
             if self._channel_pool is not None and self._channel_pool.pool_size > 0:
                 channel = await self._channel_pool.acquire()
                 source_keypair = channel.keypair
             else:
                 source_keypair = self._stellar_auth.get_keypair()
 
-            # Load account for sequence number
             account = await server.load_account(source_keypair.public_key)
 
             builder = TransactionBuilder(
                 source_account=account,
                 network_passphrase=self._network_passphrase,
-                base_fee=CONSTANTS.BASE_FEE,
+                base_fee=CONSTANTS.BASE_FEE * len(batch),
             )
             builder.set_timeout(30)
 
             main_account_id = self._stellar_auth.get_keypair().public_key
 
-            if trade_type == TradeType.BUY:
-                builder.append_manage_buy_offer_op(
-                    selling=quote_asset,
-                    buying=base_asset,
-                    amount=str(amount),
-                    price=str(price),
-                    offer_id=0,
-                    source=main_account_id,
-                )
-            else:
-                builder.append_manage_sell_offer_op(
-                    selling=base_asset,
-                    buying=quote_asset,
-                    amount=str(amount),
-                    price=str(price),
-                    offer_id=0,
-                    source=main_account_id,
-                )
+            # Add each operation to the transaction
+            for op in batch:
+                base_asset, quote_asset = trading_pair_to_assets(op.trading_pair, self._all_markets)
+
+                if op.is_cancel:
+                    # Cancel operation
+                    if op.cancel_trade_type == TradeType.SELL:
+                        builder.append_manage_sell_offer_op(
+                            selling=base_asset,
+                            buying=quote_asset,
+                            amount="0",
+                            price="1",
+                            offer_id=op.cancel_offer_id,
+                            source=main_account_id,
+                        )
+                    else:
+                        builder.append_manage_buy_offer_op(
+                            selling=quote_asset,
+                            buying=base_asset,
+                            amount="0",
+                            price="1",
+                            offer_id=op.cancel_offer_id,
+                            source=main_account_id,
+                        )
+                else:
+                    # New order operation
+                    if op.trade_type == TradeType.BUY:
+                        builder.append_manage_buy_offer_op(
+                            selling=quote_asset,
+                            buying=base_asset,
+                            amount=str(op.amount),
+                            price=str(op.price),
+                            offer_id=0,
+                            source=main_account_id,
+                        )
+                    else:
+                        builder.append_manage_sell_offer_op(
+                            selling=base_asset,
+                            buying=quote_asset,
+                            amount=str(op.amount),
+                            price=str(op.price),
+                            offer_id=0,
+                            source=main_account_id,
+                        )
 
             tx = builder.build()
             tx.sign(self._stellar_auth.get_keypair())
@@ -342,57 +439,76 @@ class StellarExchange(ExchangePyBase):
                 tx.sign(channel.keypair)
 
             response = await server.send_transaction(tx)
-            transact_time = time.time()
+            submit_time = time.time()
 
             self.logger().info(
-                f"Submitted order {order_id}: status={response.status}, hash={response.hash}"
+                f"Submitted batch tx ({len(batch)} ops): "
+                f"status={response.status}, hash={response.hash}"
             )
 
             if response.status == SendTransactionStatus.ERROR:
-                # Release channel immediately on error
                 if channel is not None and self._channel_pool is not None:
                     self._channel_pool.release(channel)
                     channel = None
-                raise Exception(f"Transaction submission failed: {response.status}")
+                raise Exception(f"Batch transaction submission failed: {response.status}")
 
-            # Mark order as PENDING_CREATE now that tx is submitted
-            order_update = OrderUpdate(
-                client_order_id=order_id,
-                exchange_order_id=response.hash,
-                trading_pair=trading_pair,
-                update_timestamp=transact_time,
-                new_state=OrderState.PENDING_CREATE,
-            )
-            self._order_tracker.process_order_update(order_update)
+            # Mark all orders as PENDING_CREATE and resolve futures with tx_hash
+            order_ids = []
+            trading_pairs = []
+            cancel_offer_ids = {}
+            is_cancel_flags = {}
 
-            # Track the pending transaction — channel is held until confirmation
+            for op in batch:
+                order_ids.append(op.client_order_id)
+                trading_pairs.append(op.trading_pair)
+                is_cancel_flags[op.client_order_id] = op.is_cancel
+
+                if op.is_cancel:
+                    cancel_offer_ids[op.client_order_id] = op.cancel_offer_id
+                else:
+                    # Mark as PENDING_CREATE
+                    order_update = OrderUpdate(
+                        client_order_id=op.client_order_id,
+                        exchange_order_id=response.hash,
+                        trading_pair=op.trading_pair,
+                        update_timestamp=submit_time,
+                        new_state=OrderState.PENDING_CREATE,
+                    )
+                    self._order_tracker.process_order_update(order_update)
+
+                # Resolve the future so _place_order / _place_cancel can return
+                if not op.future.done():
+                    op.future.set_result(response.hash)
+
+            # Track the batch as a single pending transaction
             pending = PendingTransaction(
                 tx_hash=response.hash,
-                client_order_id=order_id,
-                trading_pair=trading_pair,
-                submit_time=transact_time,
+                order_ids=order_ids,
+                trading_pairs=trading_pairs,
+                submit_time=submit_time,
                 channel=channel,
+                cancel_offer_ids=cancel_offer_ids if cancel_offer_ids else None,
+                is_cancel_flags=is_cancel_flags,
             )
             self._pending_transactions[response.hash] = pending
-            self._tx_hash_to_order_id[response.hash] = order_id
-
-            # Return tx_hash as temporary exchange_order_id
-            # Order stays in PENDING_CREATE — the resolver will confirm it
-            return response.hash, transact_time
 
         except Exception as e:
             # Release channel on failure
             if channel is not None and self._channel_pool is not None:
                 self._channel_pool.release(channel)
-            order_update = OrderUpdate(
-                trading_pair=trading_pair,
-                update_timestamp=time.time(),
-                new_state=OrderState.FAILED,
-                client_order_id=order_id,
-            )
-            self._order_tracker.process_order_update(order_update)
-            self.logger().error(f"Order {order_id} submission failed: {e}")
-            raise
+            # Fail all operations in the batch
+            for op in batch:
+                if not op.future.done():
+                    op.future.set_exception(e)
+                if not op.is_cancel:
+                    order_update = OrderUpdate(
+                        trading_pair=op.trading_pair,
+                        update_timestamp=time.time(),
+                        new_state=OrderState.FAILED,
+                        client_order_id=op.client_order_id,
+                    )
+                    self._order_tracker.process_order_update(order_update)
+            self.logger().error(f"Batch submission failed: {e}", exc_info=True)
         finally:
             await server.close()
 
@@ -401,8 +517,8 @@ class StellarExchange(ExchangePyBase):
     async def _pending_order_resolver_loop(self):
         """
         Background loop that polls pending transactions for confirmation.
-        On success: extracts the offer ID, maps it, and transitions order to OPEN.
-        On failure or timeout: transitions order to FAILED.
+        On success: extracts offer IDs, maps them, and transitions orders to OPEN.
+        On failure or timeout: transitions orders to FAILED.
         """
         while True:
             try:
@@ -418,39 +534,36 @@ class StellarExchange(ExchangePyBase):
                             result = await server.get_transaction(tx_hash)
 
                             if result.status == GetTransactionStatus.SUCCESS:
-                                self._resolve_pending_order(pending, result)
+                                self._resolve_pending_batch(pending, result)
                                 resolved_hashes.append(tx_hash)
 
                             elif result.status == GetTransactionStatus.FAILED:
                                 self.logger().error(
-                                    f"Transaction {tx_hash} for order {pending.client_order_id} failed on-chain"
+                                    f"Batch tx {tx_hash} ({len(pending.order_ids)} ops) failed on-chain"
                                 )
-                                self._fail_pending_order(pending)
+                                self._fail_pending_batch(pending)
                                 resolved_hashes.append(tx_hash)
 
                             elif result.status == GetTransactionStatus.NOT_FOUND:
-                                # Check timeout
                                 elapsed = time.time() - pending.submit_time
                                 if elapsed > PENDING_TX_TIMEOUT:
                                     self.logger().error(
-                                        f"Transaction {tx_hash} for order {pending.client_order_id} "
+                                        f"Batch tx {tx_hash} ({len(pending.order_ids)} ops) "
                                         f"timed out after {elapsed:.0f}s"
                                     )
-                                    self._fail_pending_order(pending)
+                                    self._fail_pending_batch(pending)
                                     resolved_hashes.append(tx_hash)
 
                         except Exception as e:
                             elapsed = time.time() - pending.submit_time
                             if elapsed > PENDING_TX_TIMEOUT:
                                 self.logger().error(
-                                    f"Transaction {tx_hash} timed out with error: {e}"
+                                    f"Batch tx {tx_hash} timed out with error: {e}"
                                 )
-                                self._fail_pending_order(pending)
+                                self._fail_pending_batch(pending)
                                 resolved_hashes.append(tx_hash)
                             else:
-                                self.logger().debug(
-                                    f"Polling tx {tx_hash}: {e}"
-                                )
+                                self.logger().debug(f"Polling tx {tx_hash}: {e}")
 
                     for tx_hash in resolved_hashes:
                         self._cleanup_pending_tx(tx_hash)
@@ -464,121 +577,130 @@ class StellarExchange(ExchangePyBase):
                 self.logger().error(f"Error in pending order resolver: {e}", exc_info=True)
                 await asyncio.sleep(PENDING_TX_POLL_INTERVAL)
 
-    def _resolve_pending_order(self, pending: PendingTransaction, tx_result):
-        """Process a successfully confirmed transaction."""
-        if pending.is_cancel:
-            # Cancel was confirmed
+    def _resolve_pending_batch(self, pending: PendingTransaction, tx_result):
+        """Process a successfully confirmed batch transaction."""
+        offer_ids = self._extract_offer_ids_from_result(tx_result)
+        is_cancel_flags = pending.is_cancel_flags or {}
+        cancel_offer_ids = pending.cancel_offer_ids or {}
+        now = time.time()
+
+        for i, client_order_id in enumerate(pending.order_ids):
+            is_cancel = is_cancel_flags.get(client_order_id, False)
+            trading_pair = pending.trading_pairs[i] if i < len(pending.trading_pairs) else ""
+
+            if is_cancel:
+                cancel_oid = cancel_offer_ids.get(client_order_id)
+                order_update = OrderUpdate(
+                    client_order_id=client_order_id,
+                    exchange_order_id=str(cancel_oid) if cancel_oid else None,
+                    trading_pair=trading_pair,
+                    update_timestamp=now,
+                    new_state=OrderState.CANCELED,
+                )
+                self._order_tracker.process_order_update(order_update)
+                if cancel_oid:
+                    self._offer_id_to_order_id.pop(cancel_oid, None)
+                self.logger().info(f"Cancel confirmed for order {client_order_id}")
+            else:
+                # Extract the offer_id for this operation (by index)
+                offer_id = offer_ids[i] if i < len(offer_ids) else None
+
+                if offer_id is not None:
+                    exchange_order_id = str(offer_id)
+                    self._offer_id_to_order_id[offer_id] = client_order_id
+                else:
+                    exchange_order_id = pending.tx_hash
+
+                # Explicitly update exchange_order_id on the tracked order
+                tracked_order = self._order_tracker.active_orders.get(client_order_id)
+                if tracked_order is not None:
+                    tracked_order.update_exchange_order_id(exchange_order_id)
+
+                order_update = OrderUpdate(
+                    client_order_id=client_order_id,
+                    exchange_order_id=exchange_order_id,
+                    trading_pair=trading_pair,
+                    update_timestamp=now,
+                    new_state=OrderState.OPEN,
+                )
+                self._order_tracker.process_order_update(order_update)
+                self.logger().info(
+                    f"Order {client_order_id} confirmed: offer_id={offer_id}, hash={pending.tx_hash}"
+                )
+
+    def _fail_pending_batch(self, pending: PendingTransaction):
+        """Mark all orders in a pending batch as failed."""
+        is_cancel_flags = pending.is_cancel_flags or {}
+        for i, client_order_id in enumerate(pending.order_ids):
+            is_cancel = is_cancel_flags.get(client_order_id, False)
+            if is_cancel:
+                self.logger().error(f"Cancel failed for order {client_order_id}")
+                continue
+            trading_pair = pending.trading_pairs[i] if i < len(pending.trading_pairs) else ""
             order_update = OrderUpdate(
-                client_order_id=pending.client_order_id,
-                exchange_order_id=str(pending.cancel_offer_id) if pending.cancel_offer_id else None,
-                trading_pair=pending.trading_pair,
+                client_order_id=client_order_id,
+                trading_pair=trading_pair,
                 update_timestamp=time.time(),
-                new_state=OrderState.CANCELED,
+                new_state=OrderState.FAILED,
             )
             self._order_tracker.process_order_update(order_update)
-            if pending.cancel_offer_id:
-                self._offer_id_to_order_id.pop(pending.cancel_offer_id, None)
-            self.logger().info(
-                f"Cancel confirmed for order {pending.client_order_id}"
-            )
-            return
-
-        # Order placement was confirmed — extract offer ID
-        offer_id = self._extract_offer_id_from_result(tx_result)
-
-        if offer_id is not None:
-            exchange_order_id = str(offer_id)
-            self._offer_id_to_order_id[offer_id] = pending.client_order_id
-        else:
-            # Couldn't extract offer ID — the order may have been immediately filled
-            exchange_order_id = pending.tx_hash
-
-        # Explicitly update exchange_order_id on the tracked order since the
-        # framework won't overwrite a non-None value via process_order_update
-        tracked_order = self._order_tracker.active_orders.get(pending.client_order_id)
-        if tracked_order is not None:
-            tracked_order.update_exchange_order_id(exchange_order_id)
-
-        order_update = OrderUpdate(
-            client_order_id=pending.client_order_id,
-            exchange_order_id=exchange_order_id,
-            trading_pair=pending.trading_pair,
-            update_timestamp=time.time(),
-            new_state=OrderState.OPEN,
-        )
-        self._order_tracker.process_order_update(order_update)
-        self.logger().info(
-            f"Order {pending.client_order_id} confirmed: offer_id={offer_id}, hash={pending.tx_hash}"
-        )
-
-    def _fail_pending_order(self, pending: PendingTransaction):
-        """Mark a pending order as failed."""
-        if pending.is_cancel:
-            self.logger().error(f"Cancel failed for order {pending.client_order_id}")
-            return
-        order_update = OrderUpdate(
-            client_order_id=pending.client_order_id,
-            trading_pair=pending.trading_pair,
-            update_timestamp=time.time(),
-            new_state=OrderState.FAILED,
-        )
-        self._order_tracker.process_order_update(order_update)
 
     def _cleanup_pending_tx(self, tx_hash: str):
         """Release channel account and clean up pending tx tracking."""
         pending = self._pending_transactions.pop(tx_hash, None)
         if pending and pending.channel is not None and self._channel_pool is not None:
             self._channel_pool.release(pending.channel)
-        self._tx_hash_to_order_id.pop(tx_hash, None)
 
     # ---- Offer ID extraction ----
 
-    def _extract_offer_id_from_result(self, tx_result) -> Optional[int]:
-        """Extract the offer ID from a transaction result."""
+    def _extract_offer_ids_from_result(self, tx_result) -> List[Optional[int]]:
+        """Extract offer IDs from a transaction result, one per operation in order."""
+        offer_ids = []
         try:
             if hasattr(tx_result, 'result_xdr') and tx_result.result_xdr:
                 from stellar_sdk.xdr import TransactionResult
                 result = TransactionResult.from_xdr(tx_result.result_xdr)
                 for op_result in result.result.results:
                     tr = op_result.tr
+                    offer_id = None
                     # Check ManageSellOffer result
                     if tr.manage_sell_offer_result is not None:
                         offer_result = tr.manage_sell_offer_result.success
                         if offer_result and offer_result.offer and offer_result.offer.offer:
-                            return offer_result.offer.offer.offer_id.int64
+                            offer_id = offer_result.offer.offer.offer_id.int64
                     # Check ManageBuyOffer result
                     if tr.manage_buy_offer_result is not None:
                         offer_result = tr.manage_buy_offer_result.success
                         if offer_result and offer_result.offer and offer_result.offer.offer:
-                            return offer_result.offer.offer.offer_id.int64
+                            offer_id = offer_result.offer.offer.offer_id.int64
+                    offer_ids.append(offer_id)
         except Exception as e:
-            self.logger().debug(f"Could not extract offer ID from result: {e}")
-        return None
+            self.logger().debug(f"Could not extract offer IDs from result: {e}")
+        return offer_ids
 
-    # ---- Cancel order (non-blocking) ----
+    # ---- Cancel order (batched) ----
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
-        """Submit a cancel transaction and return immediately. Confirmation via background resolver."""
+        """Queue a cancel for batched submission."""
         exchange_order_id = tracked_order.exchange_order_id
 
         # If the order is still pending confirmation (no offer_id yet),
-        # we can't cancel it on-chain. Wait briefly for the resolver to confirm it.
+        # wait for the resolver to confirm it first.
         if exchange_order_id is None or not exchange_order_id.isdigit():
-            # Check if there's a pending tx for this order
             pending_hash = None
             for tx_hash, pending in self._pending_transactions.items():
-                if pending.client_order_id == order_id and not pending.is_cancel:
-                    pending_hash = tx_hash
-                    break
+                if order_id in pending.order_ids:
+                    is_cancel = (pending.is_cancel_flags or {}).get(order_id, False)
+                    if not is_cancel:
+                        pending_hash = tx_hash
+                        break
 
             if pending_hash is not None:
-                # Wait for the pending tx to resolve (up to 10s)
                 for _ in range(20):
                     if pending_hash not in self._pending_transactions:
                         break
                     await asyncio.sleep(0.5)
 
-                # Re-check after waiting
                 tracked_order = self._order_tracker.active_orders.get(order_id)
                 if tracked_order is None:
                     self.logger().info(f"Order {order_id} already resolved, skip cancel")
@@ -592,88 +714,26 @@ class StellarExchange(ExchangePyBase):
                 )
                 return False
 
-        server = self._get_soroban_server()
-        channel = None
+        offer_id = int(exchange_order_id)
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+
+        op = BatchedOperation(
+            client_order_id=order_id,
+            trading_pair=tracked_order.trading_pair,
+            future=future,
+            is_cancel=True,
+            cancel_offer_id=offer_id,
+            cancel_trade_type=tracked_order.trade_type,
+        )
+        await self._batch_queue.put(op)
 
         try:
-            offer_id = int(exchange_order_id)
-            base_asset, quote_asset = trading_pair_to_assets(
-                tracked_order.trading_pair, self._all_markets
-            )
-
-            if self._channel_pool is not None and self._channel_pool.pool_size > 0:
-                channel = await self._channel_pool.acquire()
-                source_keypair = channel.keypair
-            else:
-                source_keypair = self._stellar_auth.get_keypair()
-
-            account = await server.load_account(source_keypair.public_key)
-            main_account_id = self._stellar_auth.get_keypair().public_key
-
-            builder = TransactionBuilder(
-                source_account=account,
-                network_passphrase=self._network_passphrase,
-                base_fee=CONSTANTS.BASE_FEE,
-            )
-            builder.set_timeout(30)
-
-            if tracked_order.trade_type == TradeType.SELL:
-                builder.append_manage_sell_offer_op(
-                    selling=base_asset,
-                    buying=quote_asset,
-                    amount="0",
-                    price="1",
-                    offer_id=offer_id,
-                    source=main_account_id,
-                )
-            else:
-                builder.append_manage_buy_offer_op(
-                    selling=quote_asset,
-                    buying=base_asset,
-                    amount="0",
-                    price="1",
-                    offer_id=offer_id,
-                    source=main_account_id,
-                )
-
-            tx = builder.build()
-            tx.sign(self._stellar_auth.get_keypair())
-            if channel is not None:
-                tx.sign(channel.keypair)
-
-            response = await server.send_transaction(tx)
-
-            self.logger().info(
-                f"Submitted cancel for order {order_id} (offer {offer_id}): "
-                f"status={response.status}, hash={response.hash}"
-            )
-
-            if response.status == SendTransactionStatus.ERROR:
-                if channel is not None and self._channel_pool is not None:
-                    self._channel_pool.release(channel)
-                    channel = None
-                raise Exception(f"Cancel transaction submission failed: {response.status}")
-
-            # Track the cancel as a pending transaction
-            pending = PendingTransaction(
-                tx_hash=response.hash,
-                client_order_id=order_id,
-                trading_pair=tracked_order.trading_pair,
-                submit_time=time.time(),
-                channel=channel,
-                is_cancel=True,
-                cancel_offer_id=offer_id,
-            )
-            self._pending_transactions[response.hash] = pending
+            await future
             return True
-
         except Exception as e:
-            if channel is not None and self._channel_pool is not None:
-                self._channel_pool.release(channel)
-            self.logger().error(f"Order cancellation submission failed for {order_id}: {e}")
+            self.logger().error(f"Order cancellation failed for {order_id}: {e}")
             return False
-        finally:
-            await server.close()
 
     # ---- Cancel and process update ----
 
