@@ -1006,6 +1006,17 @@ class StellarExchange(ExchangePyBase):
                 new_state=tracked_order.current_state,
             )
 
+        # If exchange_order_id is still a tx_hash (not a numeric offer_id),
+        # the order is still pending confirmation — let the resolver handle it
+        if not tracked_order.exchange_order_id.isdigit():
+            return OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=tracked_order.exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=time.time(),
+                new_state=tracked_order.current_state,
+            )
+
         server = self._get_soroban_server()
         try:
             offer_id = int(tracked_order.exchange_order_id)
