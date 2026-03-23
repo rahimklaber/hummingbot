@@ -1,17 +1,10 @@
 import asyncio
-import base64
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from stellar_sdk import AiohttpClient, SorobanServerAsync
-
 from hummingbot.connector.exchange.stellar import stellar_constants as CONSTANTS
-from hummingbot.connector.exchange.stellar.stellar_ledger_reader import (
-    InternalStellarOrderBook,
-    get_ledger_entry_changes_for_ledger,
-    get_order_changes_from_ledger_entry_changes,
-    get_trades_from_ledger_entry_changes,
-)
+from hummingbot.connector.exchange.stellar.stellar_ledger_reader import InternalStellarOrderBook
+from hummingbot.connector.exchange.stellar.stellar_ledger_stream import StellarLedgerEvent
 from hummingbot.connector.exchange.stellar.stellar_order_book import StellarOrderBook
 from hummingbot.connector.exchange.stellar.stellar_utils import trading_pair_to_assets
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
@@ -26,9 +19,9 @@ class StellarAPIOrderBookDataSource(OrderBookTrackerDataSource):
     """
     Order book data source for the Stellar DEX.
 
-    Instead of WebSocket subscriptions, this polls Soroban RPC ``get_ledgers()``
-    for new ledgers, parses ``LedgerCloseMeta`` to extract order book changes
-    and trades, and emits snapshot / trade messages.
+    Instead of WebSocket subscriptions, this consumes events from the connector's
+    shared Stellar ledger stream, updates local order book state, and emits
+    snapshot / trade messages.
     """
 
     _logger: Optional[HummingbotLogger] = None
@@ -40,19 +33,11 @@ class StellarAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._trade_messages_queue_key = CONSTANTS.TRADE_EVENT_TYPE
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._snapshot_messages_queue_key = CONSTANTS.SNAPSHOT_EVENT_TYPE
-        self._last_processed_ledger: int = 0
         self._internal_order_books: Dict[str, InternalStellarOrderBook] = {}
-
-    # -- helpers --------------------------------------------------------------
+        self._subscription_queue: Optional[asyncio.Queue] = None
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain=None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
-
-    def _get_soroban_server(self) -> SorobanServerAsync:
-        return SorobanServerAsync(
-            server_url=self._connector._rpc_url,
-            client=AiohttpClient(),
-        )
 
     def _initialize_order_books(self):
         for trading_pair in self._trading_pairs:
@@ -63,59 +48,14 @@ class StellarAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 selling_asset=base_asset, buying_asset=quote_asset
             )
 
-    # -- ledger polling -------------------------------------------------------
-
-    async def _poll_ledgers(self):
-        """Poll for new ledgers and process them."""
-        if not self._internal_order_books:
-            self._initialize_order_books()
-
-        server = self._get_soroban_server()
+    def _process_ledger_event(self, event: StellarLedgerEvent):
+        """Process a single ledger event for order-book changes and trades."""
         try:
-            if self._last_processed_ledger == 0:
-                latest = await server.get_latest_ledger()
-                self._last_processed_ledger = latest.sequence - 1
-                self.logger().info(
-                    f"Starting ledger polling from sequence {self._last_processed_ledger + 1}"
-                )
-
-            response = await server.get_ledgers(
-                start_ledger=self._last_processed_ledger + 1,
-                limit=CONSTANTS.GET_LEDGERS_BATCH_SIZE,
-            )
-
-            if not response.ledgers:
-                return
-
-            for ledger_info in response.ledgers:
-                try:
-                    from stellar_sdk.xdr import LedgerCloseMeta
-
-                    meta = LedgerCloseMeta.from_xdr_bytes(
-                        base64.b64decode(ledger_info.metadata_xdr)
-                    )
-                    self._process_ledger(meta, ledger_info.sequence)
-                    self._last_processed_ledger = ledger_info.sequence
-                except Exception as e:
-                    self.logger().error(
-                        f"Error processing ledger {ledger_info.sequence}: {e}"
-                    )
-                    self._last_processed_ledger = ledger_info.sequence
-        finally:
-            await server.close()
-
-    def _process_ledger(self, meta, ledger_sequence: int):
-        """Process a single ledger's close meta for order-book changes and trades."""
-        try:
-            entry_changes = get_ledger_entry_changes_for_ledger(meta)
-            order_changes = get_order_changes_from_ledger_entry_changes(entry_changes)
-            trades = get_trades_from_ledger_entry_changes(entry_changes, meta)
-
             for trading_pair, order_book in self._internal_order_books.items():
-                for change in order_changes:
+                for change in event.order_changes:
                     order_book.apply_order_change(change)
 
-            for trade in trades:
+            for trade in event.trades:
                 trade_data = {
                     "trading_pair": trade["trading_pair"],
                     "trade": {
@@ -133,20 +73,25 @@ class StellarAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         self._message_queue[CONSTANTS.TRADE_EVENT_TYPE].put_nowait(trade_data)
                         break
         except Exception as e:
-            self.logger().error(f"Error processing ledger {ledger_sequence}: {e}")
+            self.logger().error(f"Error processing ledger {event.ledger_sequence}: {e}")
 
     # -- subscription loop (overrides base WebSocket approach) ----------------
 
     async def listen_for_subscriptions(self):
-        """Main loop that polls for new ledgers instead of using WebSocket."""
-        while True:
-            try:
-                await self._poll_ledgers()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger().error(f"Error in ledger polling: {e}", exc_info=True)
-            await self._sleep(CONSTANTS.LEDGER_POLL_INTERVAL)
+        """Consume shared ledger events instead of polling RPC directly."""
+        if not self._internal_order_books:
+            self._initialize_order_books()
+        self._subscription_queue = await self._connector._ledger_stream.subscribe()
+        try:
+            while True:
+                event = await self._subscription_queue.get()
+                self._process_ledger_event(event)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._subscription_queue is not None:
+                await self._connector._ledger_stream.unsubscribe(self._subscription_queue)
+                self._subscription_queue = None
 
     # -- snapshots ------------------------------------------------------------
 

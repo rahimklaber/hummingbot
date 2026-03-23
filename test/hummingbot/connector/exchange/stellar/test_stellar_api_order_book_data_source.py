@@ -1,6 +1,7 @@
 import unittest
+from asyncio import Queue
 from unittest.async_case import IsolatedAsyncioTestCase
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from stellar_sdk import Asset
 
@@ -10,6 +11,7 @@ from hummingbot.connector.exchange.stellar.stellar_ledger_reader import (
     StellarOrder,
     StellarOrderCreated,
 )
+from hummingbot.connector.exchange.stellar.stellar_ledger_stream import StellarLedgerEvent
 from hummingbot.connector.exchange.stellar.stellar_utils import StellarMarket
 from hummingbot.core.data_type.order_book_message import OrderBookMessageType
 
@@ -19,7 +21,7 @@ USDC_ISSUER = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
 def _make_mock_connector():
     connector = MagicMock()
     connector._rpc_url = "https://soroban-testnet.stellar.org"
-    connector._custom_markets = {
+    connector._all_markets = {
         "USDC-XLM": StellarMarket(
             base="USDC",
             quote="XLM",
@@ -27,6 +29,9 @@ def _make_mock_connector():
             quote_issuer="",
         ),
     }
+    connector._ledger_stream = MagicMock()
+    connector._ledger_stream.subscribe = AsyncMock(return_value=Queue())
+    connector._ledger_stream.unsubscribe = AsyncMock()
     return connector
 
 
@@ -136,6 +141,43 @@ class TestStellarAPIOrderBookDataSource(IsolatedAsyncioTestCase):
         self.assertEqual(msg.content["asks"][0].price, 2.0)
         self.assertEqual(msg.content["asks"][0].amount, 250.0)
         self.assertIsNotNone(msg.timestamp)
+
+    async def test_process_ledger_event_updates_books_and_enqueues_trade(self):
+        ds = _make_data_source()
+        ds._initialize_order_books()
+
+        event = StellarLedgerEvent(
+            ledger_sequence=123,
+            ledger_close_time=456,
+            meta=MagicMock(),
+            entry_changes=[],
+            order_changes=[
+                StellarOrderCreated(order=StellarOrder(
+                    id=300,
+                    selling_asset=Asset("USDC", USDC_ISSUER),
+                    buying_asset=Asset.native(),
+                    amount=10.0,
+                    price=2.5,
+                    seller_id="GABC",
+                ))
+            ],
+            trades=[{
+                "trading_pair": "USDC-XLM",
+                "price": 2.5,
+                "amount": 1.0,
+                "trade_id": 1,
+                "trade_type": 1.0,
+                "update_id": 123,
+                "timestamp": 456,
+            }],
+        )
+
+        ds._process_ledger_event(event)
+
+        self.assertEqual(ds._internal_order_books["USDC-XLM"].get_order_count(), 1)
+        queued_trade = ds._message_queue[ds._trade_messages_queue_key].get_nowait()
+        self.assertEqual(queued_trade["trading_pair"], "USDC-XLM")
+        self.assertEqual(queued_trade["trade"]["update_id"], 123)
 
 
 if __name__ == "__main__":

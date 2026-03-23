@@ -19,6 +19,7 @@ from hummingbot.connector.exchange.stellar.stellar_ledger_reader import (
     StellarOrderRemoved,
     StellarOrderUpdated,
 )
+from hummingbot.connector.exchange.stellar.stellar_ledger_stream import StellarLedgerStream
 from hummingbot.connector.exchange.stellar.stellar_utils import (
     ChannelAccount,
     ChannelAccountPool,
@@ -114,6 +115,7 @@ class StellarExchange(ExchangePyBase):
         self._offer_id_to_order_id: Dict[int, str] = {}
         # Pending transactions awaiting confirmation
         self._pending_transactions: Dict[str, PendingTransaction] = {}
+        self._ledger_stream = StellarLedgerStream(rpc_url=self._rpc_url)
 
         # Transaction batching queue
         self._batch_queue: asyncio.Queue = asyncio.Queue()
@@ -141,6 +143,7 @@ class StellarExchange(ExchangePyBase):
 
     async def start_network(self):
         await super().start_network()
+        await self._ledger_stream.start()
         self._pending_order_resolver_task = safe_ensure_future(self._pending_order_resolver_loop())
         self._tx_batcher_task = safe_ensure_future(self._tx_batcher_loop())
 
@@ -157,6 +160,7 @@ class StellarExchange(ExchangePyBase):
                 self._channel_pool.release(pending_tx.channel)
         self._pending_transactions.clear()
         await super().stop_network()
+        await self._ledger_stream.stop()
 
     # ---- Properties ----
 
@@ -922,7 +926,7 @@ class StellarExchange(ExchangePyBase):
                 elif event_type == "balance_update":
                     pass  # Balances are updated periodically via _update_balances
                 elif event_type == "trade":
-                    pass  # Trades are processed via order changes
+                    self._process_trade_event(event_message)
 
             except asyncio.CancelledError:
                 raise
@@ -934,7 +938,6 @@ class StellarExchange(ExchangePyBase):
     async def _process_order_change_event(self, event: dict):
         """Process an order change event from the user stream."""
         change = event["change"]
-        ledger_sequence = event["ledger_sequence"]
         timestamp = event["timestamp"]
 
         if isinstance(change, StellarOrderCreated):
@@ -964,31 +967,8 @@ class StellarExchange(ExchangePyBase):
             tracked_order = self._order_tracker.active_orders.get(client_order_id)
             if tracked_order is None:
                 return
-            # Offer was updated (partial fill)
             if tracked_order.current_state in [OrderState.OPEN, OrderState.PARTIALLY_FILLED]:
-                # Calculate fill amount from the difference
-                original_amount = tracked_order.amount
-                remaining_amount = Decimal(str(change.order.amount))
-                filled_amount = original_amount - remaining_amount
-
-                if filled_amount > Decimal("0"):
-                    fee = AddedToCostTradeFee(
-                        percent=Decimal("0"),
-                        flat_fees=[TokenAmount(token="XLM", amount=Decimal("0.00001"))],
-                    )
-                    trade_update = TradeUpdate(
-                        trade_id=f"{offer_id}_{ledger_sequence}",
-                        client_order_id=client_order_id,
-                        exchange_order_id=str(offer_id),
-                        trading_pair=tracked_order.trading_pair,
-                        fee=fee,
-                        fill_base_amount=filled_amount,
-                        fill_quote_amount=filled_amount * Decimal(str(change.order.price)),
-                        fill_price=Decimal(str(change.order.price)),
-                        fill_timestamp=timestamp,
-                    )
-                    self._order_tracker.process_trade_update(trade_update)
-
+                if tracked_order.executed_amount_base > Decimal("0"):
                     order_update = OrderUpdate(
                         client_order_id=client_order_id,
                         exchange_order_id=str(offer_id),
@@ -1018,27 +998,6 @@ class StellarExchange(ExchangePyBase):
                 )
                 self._order_tracker.process_order_update(order_update)
             else:
-                # Order was fully filled (removed from book)
-                fee = AddedToCostTradeFee(
-                    percent=Decimal("0"),
-                    flat_fees=[TokenAmount(token="XLM", amount=Decimal("0.00001"))],
-                )
-                # Remaining amount was filled
-                remaining = tracked_order.amount - tracked_order.executed_amount_base
-                if remaining > Decimal("0") and tracked_order.price:
-                    trade_update = TradeUpdate(
-                        trade_id=f"{offer_id}_{timestamp}",
-                        client_order_id=client_order_id,
-                        exchange_order_id=str(offer_id),
-                        trading_pair=tracked_order.trading_pair,
-                        fee=fee,
-                        fill_base_amount=remaining,
-                        fill_quote_amount=remaining * tracked_order.price,
-                        fill_price=tracked_order.price,
-                        fill_timestamp=timestamp,
-                    )
-                    self._order_tracker.process_trade_update(trade_update)
-
                 order_update = OrderUpdate(
                     client_order_id=client_order_id,
                     exchange_order_id=str(offer_id),
@@ -1050,6 +1009,41 @@ class StellarExchange(ExchangePyBase):
 
             # Cleanup
             self._offer_id_to_order_id.pop(offer_id, None)
+
+    def _process_trade_event(self, event: dict):
+        trade = event["trade"]
+        offer_id = trade.get("offer_id")
+        if offer_id is None:
+            return
+
+        client_order_id = self._offer_id_to_order_id.get(int(offer_id))
+        if client_order_id is None:
+            return
+
+        tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
+        if tracked_order is None or tracked_order.price is None:
+            return
+
+        fill_base_amount = Decimal(str(trade["amount"]))
+        if fill_base_amount <= Decimal("0"):
+            return
+
+        fee = AddedToCostTradeFee(
+            percent=Decimal("0"),
+            flat_fees=[TokenAmount(token="XLM", amount=Decimal("0.00001"))],
+        )
+        trade_update = TradeUpdate(
+            trade_id=str(trade["trade_id"]),
+            client_order_id=client_order_id,
+            exchange_order_id=str(offer_id),
+            trading_pair=tracked_order.trading_pair,
+            fee=fee,
+            fill_base_amount=fill_base_amount,
+            fill_quote_amount=fill_base_amount * tracked_order.price,
+            fill_price=tracked_order.price,
+            fill_timestamp=event["timestamp"],
+        )
+        self._order_tracker.process_trade_update(trade_update)
 
     # ---- Cancel all ----
 
@@ -1128,6 +1122,24 @@ class StellarExchange(ExchangePyBase):
                 if tracked_order.current_state == OrderState.PENDING_CANCEL:
                     new_state = OrderState.CANCELED
                 else:
+                    remaining = tracked_order.amount - tracked_order.executed_amount_base
+                    if remaining > Decimal("0") and tracked_order.price is not None:
+                        fee = AddedToCostTradeFee(
+                            percent=Decimal("0"),
+                            flat_fees=[TokenAmount(token="XLM", amount=Decimal("0.00001"))],
+                        )
+                        trade_update = TradeUpdate(
+                            trade_id=f"{tracked_order.exchange_order_id}_{int(time.time())}_status",
+                            client_order_id=tracked_order.client_order_id,
+                            exchange_order_id=tracked_order.exchange_order_id,
+                            trading_pair=tracked_order.trading_pair,
+                            fee=fee,
+                            fill_base_amount=remaining,
+                            fill_quote_amount=remaining * tracked_order.price,
+                            fill_price=tracked_order.price,
+                            fill_timestamp=time.time(),
+                        )
+                        self._order_tracker.process_trade_update(trade_update)
                     new_state = OrderState.FILLED
                 return OrderUpdate(
                     client_order_id=tracked_order.client_order_id,
