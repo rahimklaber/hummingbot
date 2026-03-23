@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 from bidict import bidict
 from stellar_sdk import AiohttpClient, Keypair, Network, SorobanServerAsync, TransactionBuilder
+from stellar_sdk.soroban_rpc import GetTransactionStatus, SendTransactionStatus
 
 from hummingbot.connector.client_order_tracker import ClientOrderTracker
 from hummingbot.connector.constants import s_decimal_NaN
@@ -347,7 +348,7 @@ class StellarExchange(ExchangePyBase):
                 f"Submitted order {order_id}: status={response.status}, hash={response.hash}"
             )
 
-            if response.status == "ERROR":
+            if response.status == SendTransactionStatus.ERROR:
                 # Release channel immediately on error
                 if channel is not None and self._channel_pool is not None:
                     self._channel_pool.release(channel)
@@ -416,18 +417,18 @@ class StellarExchange(ExchangePyBase):
                         try:
                             result = await server.get_transaction(tx_hash)
 
-                            if result.status == "SUCCESS":
+                            if result.status == GetTransactionStatus.SUCCESS:
                                 self._resolve_pending_order(pending, result)
                                 resolved_hashes.append(tx_hash)
 
-                            elif result.status == "FAILED":
+                            elif result.status == GetTransactionStatus.FAILED:
                                 self.logger().error(
                                     f"Transaction {tx_hash} for order {pending.client_order_id} failed on-chain"
                                 )
                                 self._fail_pending_order(pending)
                                 resolved_hashes.append(tx_hash)
 
-                            elif result.status == "NOT_FOUND":
+                            elif result.status == GetTransactionStatus.NOT_FOUND:
                                 # Check timeout
                                 elapsed = time.time() - pending.submit_time
                                 if elapsed > PENDING_TX_TIMEOUT:
@@ -641,7 +642,7 @@ class StellarExchange(ExchangePyBase):
                 f"status={response.status}, hash={response.hash}"
             )
 
-            if response.status == "ERROR":
+            if response.status == SendTransactionStatus.ERROR:
                 if channel is not None and self._channel_pool is not None:
                     self._channel_pool.release(channel)
                     channel = None
