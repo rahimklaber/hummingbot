@@ -493,6 +493,12 @@ class StellarExchange(ExchangePyBase):
             # Couldn't extract offer ID — the order may have been immediately filled
             exchange_order_id = pending.tx_hash
 
+        # Explicitly update exchange_order_id on the tracked order since the
+        # framework won't overwrite a non-None value via process_order_update
+        tracked_order = self._order_tracker.active_orders.get(pending.client_order_id)
+        if tracked_order is not None:
+            tracked_order.update_exchange_order_id(exchange_order_id)
+
         order_update = OrderUpdate(
             client_order_id=pending.client_order_id,
             exchange_order_id=exchange_order_id,
