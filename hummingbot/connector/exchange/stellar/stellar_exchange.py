@@ -2,7 +2,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from bidict import bidict
 from stellar_sdk import AiohttpClient, Keypair, Network, SorobanServerAsync, TransactionBuilder
@@ -113,6 +113,8 @@ class StellarExchange(ExchangePyBase):
 
         # Offer ID to client_order_id mapping
         self._offer_id_to_order_id: Dict[int, str] = {}
+        self._cancel_requested_order_ids: Set[str] = set()
+        self._cancel_requested_offer_ids: Set[int] = set()
         # Pending transactions awaiting confirmation
         self._pending_transactions: Dict[str, PendingTransaction] = {}
         self._ledger_stream = StellarLedgerStream(rpc_url=self._rpc_url)
@@ -603,6 +605,7 @@ class StellarExchange(ExchangePyBase):
                     new_state=OrderState.CANCELED,
                 )
                 self._order_tracker.process_order_update(order_update)
+                self._clear_cancel_requested(client_order_id, cancel_oid)
                 if cancel_oid:
                     self._offer_id_to_order_id.pop(cancel_oid, None)
                 self.logger().info(f"Cancel confirmed for order {client_order_id}")
@@ -639,6 +642,8 @@ class StellarExchange(ExchangePyBase):
         for i, client_order_id in enumerate(pending.order_ids):
             is_cancel = is_cancel_flags.get(client_order_id, False)
             if is_cancel:
+                cancel_oid = (pending.cancel_offer_ids or {}).get(client_order_id)
+                self._clear_cancel_requested(client_order_id, cancel_oid)
                 self.logger().error(f"Cancel failed for order {client_order_id}")
                 continue
             trading_pair = pending.trading_pairs[i] if i < len(pending.trading_pairs) else ""
@@ -655,6 +660,22 @@ class StellarExchange(ExchangePyBase):
         pending = self._pending_transactions.pop(tx_hash, None)
         if pending and pending.channel is not None and self._channel_pool is not None:
             self._channel_pool.release(pending.channel)
+
+    def _mark_cancel_requested(self, client_order_id: str, offer_id: Optional[int] = None):
+        self._cancel_requested_order_ids.add(client_order_id)
+        if offer_id is not None:
+            self._cancel_requested_offer_ids.add(offer_id)
+
+    def _clear_cancel_requested(self, client_order_id: str, offer_id: Optional[int] = None):
+        self._cancel_requested_order_ids.discard(client_order_id)
+        if offer_id is not None:
+            self._cancel_requested_offer_ids.discard(offer_id)
+
+    def _is_cancel_requested(self, client_order_id: str, offer_id: Optional[int] = None) -> bool:
+        return (
+            client_order_id in self._cancel_requested_order_ids
+            or (offer_id is not None and offer_id in self._cancel_requested_offer_ids)
+        )
 
     # ---- Offer ID extraction ----
 
@@ -720,6 +741,7 @@ class StellarExchange(ExchangePyBase):
                 return False
 
         offer_id = int(exchange_order_id)
+        self._mark_cancel_requested(order_id, offer_id)
         loop = asyncio.get_event_loop()
         future = loop.create_future()
 
@@ -737,6 +759,7 @@ class StellarExchange(ExchangePyBase):
             await future
             return True
         except Exception as e:
+            self._clear_cancel_requested(order_id, offer_id)
             self.logger().error(f"Order cancellation failed for {order_id}: {e}")
             return False
 
@@ -747,6 +770,8 @@ class StellarExchange(ExchangePyBase):
         if order.current_state in [OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED]:
             return order.current_state == OrderState.CANCELED
 
+        offer_id = int(order.exchange_order_id) if order.exchange_order_id and order.exchange_order_id.isdigit() else None
+        self._mark_cancel_requested(order.client_order_id, offer_id)
         order_update = OrderUpdate(
             client_order_id=order.client_order_id,
             trading_pair=order.trading_pair,
@@ -987,7 +1012,10 @@ class StellarExchange(ExchangePyBase):
             if tracked_order is None:
                 return
 
-            if tracked_order.current_state == OrderState.PENDING_CANCEL:
+            cancel_requested = self._is_cancel_requested(client_order_id, offer_id)
+            is_filled = tracked_order.executed_amount_base >= tracked_order.amount
+
+            if tracked_order.current_state == OrderState.PENDING_CANCEL or (cancel_requested and not is_filled):
                 # This was a cancellation
                 order_update = OrderUpdate(
                     client_order_id=client_order_id,
@@ -1008,6 +1036,7 @@ class StellarExchange(ExchangePyBase):
                 self._order_tracker.process_order_update(order_update)
 
             # Cleanup
+            self._clear_cancel_requested(client_order_id, offer_id)
             self._offer_id_to_order_id.pop(offer_id, None)
 
     def _process_trade_event(self, event: dict):
@@ -1119,7 +1148,11 @@ class StellarExchange(ExchangePyBase):
                 )
             else:
                 # Offer not found — it was either filled or cancelled
-                if tracked_order.current_state == OrderState.PENDING_CANCEL:
+                cancel_requested = self._is_cancel_requested(tracked_order.client_order_id, offer_id)
+                is_filled = tracked_order.executed_amount_base >= tracked_order.amount
+
+                if tracked_order.current_state == OrderState.PENDING_CANCEL or (cancel_requested and not is_filled):
+                    self._clear_cancel_requested(tracked_order.client_order_id, offer_id)
                     new_state = OrderState.CANCELED
                 else:
                     remaining = tracked_order.amount - tracked_order.executed_amount_base
@@ -1140,6 +1173,7 @@ class StellarExchange(ExchangePyBase):
                             fill_timestamp=time.time(),
                         )
                         self._order_tracker.process_trade_update(trade_update)
+                    self._clear_cancel_requested(tracked_order.client_order_id, offer_id)
                     new_state = OrderState.FILLED
                 return OrderUpdate(
                     client_order_id=tracked_order.client_order_id,

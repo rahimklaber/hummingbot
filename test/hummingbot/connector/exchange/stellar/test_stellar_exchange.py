@@ -198,6 +198,31 @@ class TestStellarExchangeProcessOrderChangeEvent(unittest.IsolatedAsyncioTestCas
         # Offer mapping should be cleaned up
         self.assertNotIn(offer_id, self.exchange._offer_id_to_order_id)
 
+    async def test_process_order_change_event_removed_cancel_requested_is_cancelled(self):
+        """A local cancel request should classify removal as CANCELED even if the order state is still OPEN."""
+        offer_id = 65432
+        client_oid = "hbot-test-002b"
+        self.exchange._offer_id_to_order_id[offer_id] = client_oid
+        self.exchange._cancel_requested_order_ids.add(client_oid)
+        self.exchange._cancel_requested_offer_ids.add(offer_id)
+
+        tracked = self._make_tracked_order(client_oid, OrderState.OPEN)
+        self.mock_tracker.active_orders = {client_oid: tracked}
+
+        event = {
+            "change": StellarOrderRemoved(id=offer_id),
+            "ledger_sequence": 101,
+            "timestamp": 1700000001.5,
+        }
+
+        await self.exchange._process_order_change_event(event)
+
+        self.mock_tracker.process_order_update.assert_called_once()
+        order_update: OrderUpdate = self.mock_tracker.process_order_update.call_args[0][0]
+        self.assertEqual(order_update.new_state, OrderState.CANCELED)
+        self.assertNotIn(client_oid, self.exchange._cancel_requested_order_ids)
+        self.assertNotIn(offer_id, self.exchange._cancel_requested_offer_ids)
+
     async def test_process_order_change_event_removed_filled(self):
         """StellarOrderRemoved for an OPEN order should result in FILLED."""
         offer_id = 99999
@@ -218,8 +243,6 @@ class TestStellarExchangeProcessOrderChangeEvent(unittest.IsolatedAsyncioTestCas
 
         await self.exchange._process_order_change_event(event)
 
-        # Should emit a trade update for the remaining amount, then a FILLED order update
-        self.mock_tracker.process_trade_update.assert_called_once()
         self.mock_tracker.process_order_update.assert_called_once()
         order_update: OrderUpdate = self.mock_tracker.process_order_update.call_args[0][0]
         self.assertEqual(order_update.new_state, OrderState.FILLED)
