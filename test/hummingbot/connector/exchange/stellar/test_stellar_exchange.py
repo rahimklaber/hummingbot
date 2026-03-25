@@ -1,6 +1,6 @@
 import unittest
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from stellar_sdk import Keypair
 
@@ -106,12 +106,43 @@ class TestStellarExchangeExtractOfferId(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.exchange = _create_exchange()
 
-    def test_extract_offer_id_from_result_returns_none_for_mock(self):
-        """A plain mock result without valid XDR should return None."""
+    def test_extract_offer_ids_from_result_returns_empty_for_mock(self):
+        """A plain mock result without valid XDR should return an empty list."""
         mock_result = MagicMock()
         mock_result.result_xdr = None
-        result = self.exchange._extract_offer_id_from_result(mock_result)
-        self.assertIsNone(result)
+        result = self.exchange._extract_offer_ids_from_result(mock_result)
+        self.assertEqual(result, [])
+
+    @patch("stellar_sdk.xdr.TransactionResult.from_xdr")
+    def test_extract_offer_ids_from_result_handles_buy_and_sell_results(self, from_xdr_mock):
+        sell_offer = MagicMock()
+        sell_offer.offer.offer.offer_id.int64 = 11
+        buy_offer = MagicMock()
+        buy_offer.offer.offer.offer_id.int64 = 22
+
+        sell_tr = MagicMock()
+        sell_tr.manage_sell_offer_result = MagicMock(success=sell_offer)
+        sell_tr.manage_buy_offer_result = None
+
+        buy_tr = MagicMock()
+        buy_tr.manage_sell_offer_result = None
+        buy_tr.manage_buy_offer_result = MagicMock(success=buy_offer)
+
+        from_xdr_mock.return_value = MagicMock(
+            result=MagicMock(
+                results=[
+                    MagicMock(tr=sell_tr),
+                    MagicMock(tr=buy_tr),
+                ]
+            )
+        )
+
+        mock_result = MagicMock()
+        mock_result.result_xdr = "xdr"
+
+        result = self.exchange._extract_offer_ids_from_result(mock_result)
+
+        self.assertEqual(result, [11, 22])
 
 
 class TestStellarExchangeProcessOrderChangeEvent(unittest.IsolatedAsyncioTestCase):
@@ -247,6 +278,36 @@ class TestStellarExchangeProcessOrderChangeEvent(unittest.IsolatedAsyncioTestCas
         order_update: OrderUpdate = self.mock_tracker.process_order_update.call_args[0][0]
         self.assertEqual(order_update.new_state, OrderState.FILLED)
         self.assertNotIn(offer_id, self.exchange._offer_id_to_order_id)
+
+
+class TestStellarExchangeRestoredOrderCleanup(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        self.exchange = _create_exchange()
+        self.exchange.stop_tracking_order = MagicMock()
+        self.exchange._order_tracker = MagicMock()
+
+    def test_cleanup_orphaned_restored_orders_removes_stale_tx_hash_orders(self):
+        stale_order = MagicMock(spec=InFlightOrder)
+        stale_order.exchange_order_id = "deadbeef"
+        stale_order.creation_timestamp = 0
+
+        self.exchange._order_tracker.active_orders = {"cid-1": stale_order}
+
+        self.exchange._cleanup_orphaned_restored_orders()
+
+        self.exchange.stop_tracking_order.assert_called_once_with("cid-1")
+
+    def test_cleanup_orphaned_restored_orders_keeps_numeric_exchange_ids(self):
+        tracked_order = MagicMock(spec=InFlightOrder)
+        tracked_order.exchange_order_id = "12345"
+        tracked_order.creation_timestamp = 0
+
+        self.exchange._order_tracker.active_orders = {"cid-2": tracked_order}
+
+        self.exchange._cleanup_orphaned_restored_orders()
+
+        self.exchange.stop_tracking_order.assert_not_called()
 
 
 if __name__ == "__main__":

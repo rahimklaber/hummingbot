@@ -1,7 +1,7 @@
 import asyncio
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Dict, List, Optional, Set, Tuple
 
 from bidict import bidict
@@ -58,7 +58,6 @@ class BatchedOperation:
     price: Optional[Decimal] = None
     # For cancels
     cancel_offer_id: Optional[int] = None
-    cancel_trade_type: Optional[TradeType] = None
 
 
 @dataclass
@@ -84,7 +83,7 @@ class StellarExchange(ExchangePyBase):
         self,
         stellar_secret_key: str,
         rpc_url: str,
-        channel_account_secret_keys: str = None,
+        channel_account_secret_keys: str = "",
         custom_markets: Optional[Dict[str, StellarMarket]] = None,
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
@@ -144,6 +143,7 @@ class StellarExchange(ExchangePyBase):
     # ---- Network lifecycle ----
 
     async def start_network(self):
+        self._cleanup_orphaned_restored_orders()
         await super().start_network()
         await self._ledger_stream.start()
         self._pending_order_resolver_task = safe_ensure_future(self._pending_order_resolver_loop())
@@ -397,48 +397,15 @@ class StellarExchange(ExchangePyBase):
 
             # Add each operation to the transaction
             for op in batch:
-                base_asset, quote_asset = trading_pair_to_assets(op.trading_pair, self._all_markets)
-
-                if op.is_cancel:
-                    # Cancel operation
-                    if op.cancel_trade_type == TradeType.SELL:
-                        builder.append_manage_sell_offer_op(
-                            selling=base_asset,
-                            buying=quote_asset,
-                            amount="0",
-                            price="1",
-                            offer_id=op.cancel_offer_id,
-                            source=main_account_id,
-                        )
-                    else:
-                        builder.append_manage_buy_offer_op(
-                            selling=quote_asset,
-                            buying=base_asset,
-                            amount="0",
-                            price="1",
-                            offer_id=op.cancel_offer_id,
-                            source=main_account_id,
-                        )
-                else:
-                    # New order operation
-                    if op.trade_type == TradeType.BUY:
-                        builder.append_manage_buy_offer_op(
-                            selling=quote_asset,
-                            buying=base_asset,
-                            amount=str(op.amount),
-                            price=str(op.price),
-                            offer_id=0,
-                            source=main_account_id,
-                        )
-                    else:
-                        builder.append_manage_sell_offer_op(
-                            selling=base_asset,
-                            buying=quote_asset,
-                            amount=str(op.amount),
-                            price=str(op.price),
-                            offer_id=0,
-                            source=main_account_id,
-                        )
+                self._append_offer_operation(
+                    builder=builder,
+                    trade_type=op.trade_type,
+                    trading_pair=op.trading_pair,
+                    amount=Decimal("0") if op.is_cancel else op.amount,
+                    price=Decimal("1") if op.is_cancel else op.price,
+                    offer_id=op.cancel_offer_id if op.is_cancel else 0,
+                    source=main_account_id,
+                )
 
             tx = builder.build()
             tx.sign(self._stellar_auth.get_keypair())
@@ -518,6 +485,47 @@ class StellarExchange(ExchangePyBase):
             self.logger().error(f"Batch submission failed: {e}", exc_info=True)
         finally:
             await server.close()
+
+    def _append_offer_operation(
+        self,
+        builder: TransactionBuilder,
+        trade_type: TradeType,
+        trading_pair: str,
+        amount: Decimal,
+        price: Decimal,
+        offer_id: int,
+        source: str,
+    ):
+        base_asset, quote_asset = trading_pair_to_assets(trading_pair, self._all_markets)
+
+        if amount == Decimal("0"):
+            raw_amount = Decimal("0")
+            raw_price = Decimal("1")
+        else:
+            raw_amount = self._quantize_stellar_decimal(amount)
+            raw_price = self._quantize_stellar_decimal(price)
+
+        if trade_type == TradeType.BUY:
+            builder.append_manage_buy_offer_op(
+                selling=quote_asset,
+                buying=base_asset,
+                amount=str(raw_amount),
+                price=str(raw_price),
+                offer_id=offer_id,
+                source=source,
+            )
+        else:
+            builder.append_manage_sell_offer_op(
+                selling=base_asset,
+                buying=quote_asset,
+                amount=str(raw_amount),
+                price=str(raw_price),
+                offer_id=offer_id,
+                source=source,
+            )
+
+    def _quantize_stellar_decimal(self, value: Decimal) -> Decimal:
+        return value.quantize(CONSTANTS.ONE_STROOP, rounding=ROUND_DOWN)
 
     # ---- Background pending order resolver ----
 
@@ -632,6 +640,12 @@ class StellarExchange(ExchangePyBase):
                     new_state=OrderState.OPEN,
                 )
                 self._order_tracker.process_order_update(order_update)
+
+                if tracked_order is not None and self._is_cancel_requested(client_order_id, offer_id):
+                    self.logger().info(
+                        f"Order {client_order_id} confirmed while cancel was pending; submitting deferred cancel."
+                    )
+                    safe_ensure_future(self._place_cancel(client_order_id, tracked_order))
                 self.logger().info(
                     f"Order {client_order_id} confirmed: offer_id={offer_id}, hash={pending.tx_hash}"
                 )
@@ -661,6 +675,32 @@ class StellarExchange(ExchangePyBase):
         if pending and pending.channel is not None and self._channel_pool is not None:
             self._channel_pool.release(pending.channel)
 
+    def _cleanup_orphaned_restored_orders(self):
+        """
+        Remove restored orders that still only have a tx hash but no live pending-tx tracking.
+        Those orders cannot be resolved after restart because batch metadata is not persisted.
+        """
+        now = time.time()
+        for client_order_id, tracked_order in list(self._order_tracker.active_orders.items()):
+            exchange_order_id = tracked_order.exchange_order_id
+            if exchange_order_id is None or exchange_order_id.isdigit():
+                continue
+            if client_order_id in self._cancel_requested_order_ids:
+                continue
+            has_live_pending_tx = any(
+                client_order_id in pending.order_ids for pending in self._pending_transactions.values()
+            )
+            if has_live_pending_tx:
+                continue
+            order_age = now - tracked_order.creation_timestamp
+            if order_age <= PENDING_TX_TIMEOUT:
+                continue
+            self.logger().warning(
+                f"Removing restored unresolved order {client_order_id} with tx hash {exchange_order_id}. "
+                "The pending transaction metadata was not available after restart, so the order cannot be reconciled."
+            )
+            self.stop_tracking_order(client_order_id)
+
     def _mark_cancel_requested(self, client_order_id: str, offer_id: Optional[int] = None):
         self._cancel_requested_order_ids.add(client_order_id)
         if offer_id is not None:
@@ -689,13 +729,11 @@ class StellarExchange(ExchangePyBase):
                 for op_result in result.result.results:
                     tr = op_result.tr
                     offer_id = None
-                    # Check ManageSellOffer result
                     if tr.manage_sell_offer_result is not None:
                         offer_result = tr.manage_sell_offer_result.success
                         if offer_result and offer_result.offer and offer_result.offer.offer:
                             offer_id = offer_result.offer.offer.offer_id.int64
-                    # Check ManageBuyOffer result
-                    if tr.manage_buy_offer_result is not None:
+                    elif tr.manage_buy_offer_result is not None:
                         offer_result = tr.manage_buy_offer_result.success
                         if offer_result and offer_result.offer and offer_result.offer.offer:
                             offer_id = offer_result.offer.offer.offer_id.int64
@@ -711,7 +749,7 @@ class StellarExchange(ExchangePyBase):
         exchange_order_id = tracked_order.exchange_order_id
 
         # If the order is still pending confirmation (no offer_id yet),
-        # wait for the resolver to confirm it first.
+        # defer the cancel until the resolver confirms it first.
         if exchange_order_id is None or not exchange_order_id.isdigit():
             pending_hash = None
             for tx_hash, pending in self._pending_transactions.items():
@@ -734,11 +772,11 @@ class StellarExchange(ExchangePyBase):
                 exchange_order_id = tracked_order.exchange_order_id
 
             if exchange_order_id is None or not exchange_order_id.isdigit():
-                self.logger().error(
-                    f"Cannot cancel order {order_id}: no valid offer_id "
+                self.logger().info(
+                    f"Deferring cancel for order {order_id} until offer_id is confirmed "
                     f"(exchange_order_id={exchange_order_id})"
                 )
-                return False
+                return True
 
         offer_id = int(exchange_order_id)
         self._mark_cancel_requested(order_id, offer_id)
@@ -750,8 +788,8 @@ class StellarExchange(ExchangePyBase):
             trading_pair=tracked_order.trading_pair,
             future=future,
             is_cancel=True,
+            trade_type=tracked_order.trade_type,
             cancel_offer_id=offer_id,
-            cancel_trade_type=tracked_order.trade_type,
         )
         await self._batch_queue.put(op)
 
