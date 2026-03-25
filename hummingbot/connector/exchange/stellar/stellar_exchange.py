@@ -214,6 +214,12 @@ class StellarExchange(ExchangePyBase):
     def is_trading_required(self) -> bool:
         return self._trading_required
 
+    @property
+    def status_dict(self) -> Dict[str, bool]:
+        status = super().status_dict
+        status["order_books_initialized"] = self._are_order_books_populated()
+        return status
+
     def supported_order_types(self):
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
@@ -261,6 +267,25 @@ class StellarExchange(ExchangePyBase):
             )
         loaded_markets.update(self._custom_markets)
         return loaded_markets
+
+    def _are_order_books_populated(self) -> bool:
+        if not self.order_book_tracker.ready:
+            return False
+
+        tracked_pairs = self.trading_pairs
+        if len(tracked_pairs) == 0:
+            return True
+
+        for trading_pair in tracked_pairs:
+            order_book = self.order_book_tracker.order_books.get(trading_pair)
+            if order_book is None:
+                return False
+            has_bid = next(iter(order_book.bid_entries()), None) is not None
+            has_ask = next(iter(order_book.ask_entries()), None) is not None
+            if not (has_bid and has_ask):
+                return False
+
+        return True
 
     async def _initialize_trading_pair_symbol_map(self):
         pass

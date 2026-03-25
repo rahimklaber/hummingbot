@@ -100,6 +100,22 @@ class TestStellarExchangeProperties(unittest.IsolatedAsyncioTestCase):
         ds = self.exchange._create_user_stream_data_source()
         self.assertIsInstance(ds, StellarAPIUserStreamDataSource)
 
+    def test_status_dict_requires_populated_order_books(self):
+        mock_order_book = MagicMock()
+        mock_order_book.bid_entries.side_effect = [iter([]), iter([MagicMock()])]
+        mock_order_book.ask_entries.side_effect = [iter([MagicMock()]), iter([MagicMock()])]
+
+        mock_tracker = MagicMock()
+        mock_tracker.ready = True
+        mock_tracker.order_books = {_TEST_TRADING_PAIR: mock_order_book}
+        self.exchange._order_book_tracker = mock_tracker
+
+        initial_status = self.exchange.status_dict
+        populated_status = self.exchange.status_dict
+
+        self.assertFalse(initial_status["order_books_initialized"])
+        self.assertTrue(populated_status["order_books_initialized"])
+
 
 class TestStellarExchangeExtractOfferId(unittest.IsolatedAsyncioTestCase):
 
