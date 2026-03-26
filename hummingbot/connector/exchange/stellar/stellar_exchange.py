@@ -755,17 +755,32 @@ class StellarExchange(ExchangePyBase):
                     tr = op_result.tr
                     offer_id = None
                     if tr.manage_sell_offer_result is not None:
-                        offer_result = tr.manage_sell_offer_result.success
-                        if offer_result and offer_result.offer and offer_result.offer.offer:
-                            offer_id = offer_result.offer.offer.offer_id.int64
+                        offer_id = self._extract_offer_id_from_success_result(tr.manage_sell_offer_result.success)
                     elif tr.manage_buy_offer_result is not None:
-                        offer_result = tr.manage_buy_offer_result.success
-                        if offer_result and offer_result.offer and offer_result.offer.offer:
-                            offer_id = offer_result.offer.offer.offer_id.int64
+                        offer_id = self._extract_offer_id_from_success_result(tr.manage_buy_offer_result.success)
                     offer_ids.append(offer_id)
         except Exception as e:
             self.logger().debug(f"Could not extract offer IDs from result: {e}")
         return offer_ids
+
+    @staticmethod
+    def _extract_offer_id_from_success_result(offer_result) -> Optional[int]:
+        if offer_result is None:
+            return None
+
+        result_offer = getattr(offer_result, "offer", None)
+        if result_offer is None:
+            return None
+
+        offer_entry = getattr(result_offer, "offer", None)
+        if offer_entry is None:
+            offer_entry = result_offer
+
+        offer_id = getattr(offer_entry, "offer_id", None)
+        if offer_id is None:
+            return None
+
+        return getattr(offer_id, "int64", offer_id)
 
     # ---- Cancel order (batched) ----
 

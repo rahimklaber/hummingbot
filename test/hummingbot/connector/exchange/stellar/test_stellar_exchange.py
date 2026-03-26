@@ -132,9 +132,9 @@ class TestStellarExchangeExtractOfferId(unittest.IsolatedAsyncioTestCase):
     @patch("stellar_sdk.xdr.TransactionResult.from_xdr")
     def test_extract_offer_ids_from_result_handles_buy_and_sell_results(self, from_xdr_mock):
         sell_offer = MagicMock()
-        sell_offer.offer.offer.offer_id.int64 = 11
+        sell_offer.offer.offer_id.int64 = 11
         buy_offer = MagicMock()
-        buy_offer.offer.offer.offer_id.int64 = 22
+        buy_offer.offer.offer_id.int64 = 22
 
         sell_tr = MagicMock()
         sell_tr.manage_sell_offer_result = MagicMock(success=sell_offer)
@@ -159,6 +159,14 @@ class TestStellarExchangeExtractOfferId(unittest.IsolatedAsyncioTestCase):
         result = self.exchange._extract_offer_ids_from_result(mock_result)
 
         self.assertEqual(result, [11, 22])
+
+    def test_extract_offer_id_from_success_result_supports_nested_mock_shape(self):
+        offer_result = MagicMock()
+        offer_result.offer.offer.offer_id.int64 = 33
+
+        result = self.exchange._extract_offer_id_from_success_result(offer_result)
+
+        self.assertEqual(result, 33)
 
 
 class TestStellarExchangeProcessOrderChangeEvent(unittest.IsolatedAsyncioTestCase):
