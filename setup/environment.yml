@@ -65,3 +65,4 @@ dependencies:
   - zlib>=1.2.13
   - pip:
     - injective-py==1.13.*
+    - stellar-sdk[aiohttp]>=13.0.0

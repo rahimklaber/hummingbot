@@ -79,7 +79,6 @@ def main():
         "ujson>=5.7.0",
         "urllib3>=1.26.15,<2.0",
         "web3",
-        "stellar-sdk>=13.0.0",
         "xrpl-py>=4.4.0",
         "PyYaml>=0.2.5",
     ]
