@@ -11,7 +11,7 @@ HBOT_ORDER_ID_PREFIX = "hbot"
 MAX_ORDER_ID_LEN = 40
 
 # Soroban RPC URL
-DEFAULT_RPC_URL = "https://mainnet.sorobanrpc.com"
+DEFAULT_RPC_URL = "https://rpc.lightsail.network"
 
 # Websocket channels
 TRADE_EVENT_TYPE = "trades"
