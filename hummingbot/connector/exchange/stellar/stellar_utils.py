@@ -11,7 +11,7 @@ from hummingbot.connector.exchange.stellar import stellar_constants as CONSTANTS
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
 CENTRALIZED = False
-EXAMPLE_PAIR = "USDC-XLM"
+EXAMPLE_PAIR = "XLM-USDC"
 DEFAULT_FEES = TradeFeeSchema(
     maker_percent_fee_decimal=Decimal("0"),
     taker_percent_fee_decimal=Decimal("0"),
